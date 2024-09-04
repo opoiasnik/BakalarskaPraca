@@ -2,65 +2,63 @@ import os
 from transformers import AutoModelForQuestionAnswering, AutoTokenizer
 from elasticsearch import Elasticsearch
 from sentence_transformers import SentenceTransformer, util
-import nltk
 import spacy
+from datasets import load_dataset
 
 # Загрузка моделей и токенизаторов
 qa_model_name = "bert-large-uncased-whole-word-masking-finetuned-squad"
 qa_model = AutoModelForQuestionAnswering.from_pretrained(qa_model_name)
 qa_tokenizer = AutoTokenizer.from_pretrained(qa_model_name)
 
+# Модель для извлечения эмбеддингов предложений
 sbert_model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
-
-nlp = spacy.load("en_core_web_sm")
 
 # Подключение к Elasticsearch
 es = Elasticsearch([{'host': 'localhost', 'port': 9200, 'scheme': 'http'}])
 
-# Функция для индексирования документов
-def index_documents(documents):
-    for i, doc in enumerate(documents):
+# Загрузка реального датасета из Hugging Face
+dataset = load_dataset("mtarasovic/ner-rent-sk-dataset")
+
+# Функция для индексирования документов в Elasticsearch
+def index_documents(dataset):
+    for i, item in enumerate(dataset['train']):
+        # Пример использования поля 'text' для индексации
+        doc = item['text']
         es.index(index='legal_docs', id=i, body={'text': doc})
         print(f"Indexed document {i}")
 
-# Пример документов
-documents = [
-    "Prvý zákon o ochrane údajov. Tento zákon sa zameriava na ochranu osobných údajov a upravuje pravidlá ich spracovania.",
-    "Druhý zákon o ochrane súkromia. Tento zákon stanovuje práva a povinnosti týkajúce sa súkromia jednotlivcov.",
-    "Tretí zákon o práve na zabudnutie. Tento zákon umožňuje jednotlivcom žiadať o vymazanie ich osobných údajov z verejných záznamov."
-]
+print("Indexing all documents from dataset...")
+index_documents(dataset)
 
-print("Indexing documents...")
-index_documents(documents)
-
-# Создание фиктивного датасета договоров аренды
-rental_documents = [
-    "Zmluva o prenájme bytu. Prenajímateľ poskytuje nájomcovi byt do užívania na dobu určitú.",
-    "Zmluva o prenájme domu. Prenajímateľ sa zaväzuje poskytnúť nájomcovi dom na bývanie za mesačné nájomné.",
-    "Zmluva o prenájme kancelárskych priestorov. Prenajímateľ poskytuje nájomcovi kancelárske priestory na podnikanie."
-]
-
-print("Indexing rental agreements...")
-index_documents(rental_documents)
-
-# Функция поиска релевантных документов
-def search_documents(query, k=10):  # Увеличиваем количество возвращаемых документов
+# Функция поиска релевантных документов с использованием Sentence Transformers
+def search_documents(query, k=10):
+    query_embedding = sbert_model.encode(query, convert_to_tensor=True)
     response = es.search(
         index='legal_docs',
         body={
             'query': {
-                'match': {
-                    'text': {
-                        'query': query,
-                        'fuzziness': 'AUTO'  # Использование размытого поиска
-                    }
-                }
+                'match_all': {}  # Запрос, который вернет все документы
             },
             'size': k
         }
     )
-    hits = [hit['_source']['text'] for hit in response['hits']['hits']]
-    return hits
+    documents = [hit['_source']['text'] for hit in response['hits']['hits']]
+    
+    # Проверка количества найденных документов
+    if not documents:
+        return []  # Возвращаем пустой список, если документы не найдены
+    
+    # Получение эмбеддингов для всех документов
+    document_embeddings = sbert_model.encode(documents, convert_to_tensor=True)
+    
+    # Нахождение наиболее релевантных документов
+    scores = util.pytorch_cos_sim(query_embedding, document_embeddings)[0]
+    
+    # Используем min(k, len(documents)) для topk
+    top_k = min(k, len(documents))
+    top_k_indices = scores.topk(top_k).indices
+    top_documents = [documents[idx] for idx in top_k_indices]
+    return top_documents
 
 # Функция для извлечения ответов с помощью модели вопрос-ответ (Question-Answering)
 def get_answer(question, context):
@@ -102,4 +100,3 @@ if __name__ == "__main__":
         answers = process_query(query)
         for doc, answer in answers:
             print(f"\nDokument: {doc}\nOdpoveď: {answer}")
-
